@@ -16,17 +16,1514 @@ This reference architecture provides a **comprehensive blueprint** for building 
 
 ---
 
-## 📋 REFERENCE ARCHITECTURE OVERVIEW
+## 🏗️ OPENCLAW ARCHITECTURE
 
-### Core System Layers
+## 📋 Overview
 
-> 💡 **Expert Tip**: Layer separation is crucial for maintainability. Each layer should have a single responsibility and communicate only with adjacent layers. This prevents tight coupling and makes testing easier.
+OpenClaw is a sophisticated agentic AI system designed for multi-channel integration, secure tool execution, and scalable deployment. This section provides a detailed architectural analysis of OpenClaw's core components, design patterns, and implementation specifics.
+
+### 🎯 System Purpose
+
+OpenClaw serves as a **unified gateway** for AI agents across multiple communication channels, providing:
+
+- **Multi-channel connectivity** (Discord, Telegram, Slack, Signal, iMessage, WhatsApp, Web)
+- **Secure sandboxed tool execution** with comprehensive security policies
+- **Lane-based concurrency** for session isolation and performance
+- **Plugin-based extensibility** for custom channels and tools
+- **Enterprise-grade security** with zero-trust principles
+- **Production-ready observability** with comprehensive monitoring
+
+---
+
+## 🏛️ CORE ARCHITECTURE
+
+### System Layer Architecture
 
 ```mermaid
 flowchart TB
-    subgraph Presentation["Presentation Layer"]
-        CLI[CLI Interface]
-        WebUI[Web Interface]
+    subgraph UserLayer["User Interface Layer"]
+        Discord[Discord Bot]
+        Telegram[Telegram Bot]
+        Slack[Slack App]
+        Web[Web Interface]
+        Signal[Signal Client]
+        iMessage[iMessage Bridge]
+        WhatsApp[WhatsApp Web]
+    end
+    
+    subgraph GatewayLayer["Gateway Layer"]
+        Gateway[Gateway Server<br/>- WebSocket support<br/>- Message routing<br/>- Authentication]
+        Auth[Authentication Manager<br/>- JWT tokens<br/>- OAuth flows<br/>- Session management]
+        Router[Message Router<br/>- Channel mapping<br/>- Format conversion<br/>- Load balancing]
+    end
+    
+    subgraph AgentLayer["Agent Layer"]
+        AgentRunner[Agent Runner<br/>- LLM orchestration<br/>- Tool execution<br/>- Context management]
+        Subagents[Subagent System<br/>- Specialized agents<br/>- Task delegation<br/>- Result aggregation]
+        SessionManager[Session Manager<br/>- Context persistence<br/>- Memory management<br/>- Lane isolation]
+    end
+    
+    subgraph ToolLayer["Tool Layer"]
+        ToolRegistry[Tool Registry<br/>- Tool discovery<br/>- Permission validation<br/>- Execution sandbox]
+        Sandbox[Sandbox Manager<br/>- Docker containers<br/>- Resource limits<br/>- Security policies]
+        FileSystem[File System Tools<br/>- Read/write operations<br/>- Directory traversal<br/>- Path validation]
+    end
+    
+    subgraph DataLayer["Data Layer"]
+        Redis[Redis Cluster<br/>- Session cache<br/>- Message queue<br/>- Rate limiting]
+        PostgreSQL[PostgreSQL<br/>- Configuration<br/>- Audit logs<br/>- User data]
+        FileSystem[File Storage<br/>- Agent workspaces<br/>- Tool outputs<br/>- Media files]
+    end
+    
+    subgraph InfraLayer["Infrastructure Layer"]
+        Monitoring[Monitoring Stack<br/>- Prometheus/Grafana<br/>- Distributed tracing<br/>- Log aggregation]
+        Security[Security Framework<br/>- Input validation<br/>- Authorization<br/>- Audit logging]
+        Deployment[Deployment<br/>- Kubernetes<br/>- Terraform<br/>- CI/CD]
+    end
+    
+    UserLayer --> GatewayLayer
+    GatewayLayer --> AgentLayer
+    AgentLayer --> ToolLayer
+    ToolLayer --> DataLayer
+    DataLayer --> InfraLayer
+    
+    InfraLayer -.-> UserLayer
+    InfraLayer -.-> GatewayLayer
+    InfraLayer -.-> AgentLayer
+```
+
+### Component Interaction Flow
+
+```mermaid
+sequenceDiagram
+    participant User as User
+    participant Channel as Channel Adapter
+    participant Gateway as Gateway Server
+    participant Auth as Auth Manager
+    participant Router as Message Router
+    participant Agent as Agent Runner
+    participant Tools as Tool System
+    participant Data as Data Layer
+    participant Monitor as Monitoring
+    
+    User->>Channel: Send Message
+    Channel->>Gateway: Forward Message
+    Gateway->>Auth: Authenticate Request
+    Auth-->>Gateway: Auth Context
+    
+    Gateway->>Router: Route Message
+    Router->>Agent: Process Message
+    
+    Agent->>Data: Load Session Context
+    Data-->>Agent: Session Data
+    
+    Agent->>Tools: Execute Tools (if needed)
+    Tools->>Tools: Validate Permissions
+    Tools->>Tools: Execute in Sandbox
+    Tools-->>Agent: Tool Results
+    
+    Agent->>Data: Update Session
+    Agent-->>Router: Agent Response
+    
+    Router-->>Gateway: Formatted Response
+    Gateway->>Monitor: Log Metrics
+    Gateway-->>Channel: Response
+    Channel-->>User: Deliver Response
+```
+
+---
+
+## 🔌 CHANNEL SYSTEM ARCHITECTURE
+
+### Channel Adapter Pattern
+
+OpenClaw uses a **plugin-based channel system** that allows seamless integration with various communication platforms while maintaining a unified interface.
+
+```typescript
+// Core channel interface
+interface Channel {
+  readonly id: string;
+  readonly type: string;
+  readonly config: ChannelConfig;
+  
+  // Lifecycle management
+  initialize(): Promise<void>;
+  start(): Promise<void>;
+  stop(): Promise<void>;
+  destroy(): Promise<void>;
+  
+  // Message handling
+  sendMessage(message: OutgoingMessage): Promise<void>;
+  onMessage(callback: (message: IncomingMessage) => void): void;
+  
+  // Health and status
+  isHealthy(): boolean;
+  getStatus(): ChannelStatus;
+}
+
+// Channel configuration
+interface ChannelConfig {
+  enabled: boolean;
+  credentials: Record<string, string>;
+  settings: Record<string, any>;
+  security: ChannelSecurityConfig;
+  rateLimit?: RateLimitConfig;
+}
+```
+
+### Discord Channel Implementation
+
+```typescript
+// Discord-specific channel implementation
+class DiscordChannel implements Channel {
+  readonly id = 'discord';
+  readonly type = 'discord';
+  private client: Client;
+  private gateway: Gateway;
+  
+  constructor(private config: DiscordConfig, gateway: Gateway) {
+    this.gateway = gateway;
+    this.client = new Client({
+      intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContents,
+        GatewayIntentBits.DirectMessages
+      ]
+    });
+  }
+  
+  async initialize(): Promise<void> {
+    // Validate configuration
+    this.validateConfig();
+    
+    // Setup event handlers
+    this.setupEventHandlers();
+    
+    // Login to Discord
+    await this.client.login(this.config.token);
+  }
+  
+  private setupEventHandlers(): void {
+    this.client.on('messageCreate', async (message) => {
+      // Skip bot messages
+      if (message.author.bot) return;
+      
+      // Convert to OpenClaw message format
+      const incomingMessage = this.convertMessage(message);
+      
+      // Forward to gateway
+      this.gateway.handleMessage(incomingMessage);
+    });
+    
+    this.client.on('error', (error) => {
+      console.error('Discord client error:', error);
+      this.gateway.reportChannelError(this.id, error);
+    });
+  }
+  
+  async sendMessage(message: OutgoingMessage): Promise<void> {
+    const channel = await this.client.channels.fetch(message.channelId);
+    if (!channel || !channel.isTextBased()) {
+      throw new Error(`Invalid channel: ${message.channelId}`);
+    }
+    
+    // Handle different message types
+    if (message.type === 'text') {
+      await channel.send(message.content);
+    } else if (message.type === 'embed') {
+      await channel.send({ embeds: [message.embed] });
+    } else if (message.type === 'file') {
+      await channel.send({
+        files: [message.file]
+      });
+    }
+  }
+  
+  private convertMessage(discordMessage: Message): IncomingMessage {
+    return {
+      id: discordMessage.id,
+      content: discordMessage.content,
+      author: {
+        id: discordMessage.author.id,
+        username: discordMessage.author.username,
+        displayName: discordMessage.author.displayName
+      },
+      channel: {
+        id: discordMessage.channel.id,
+        type: discordMessage.channel.type === ChannelType.DM ? 'dm' : 'guild',
+        name: discordMessage.channel instanceof TextChannel 
+          ? discordMessage.channel.name 
+          : 'DM'
+      },
+      timestamp: discordMessage.createdAt.toISOString(),
+      attachments: discordMessage.attachments.map(att => ({
+        id: att.id,
+        url: att.url,
+        filename: att.name,
+        contentType: att.contentType,
+        size: att.size
+      })),
+      mentions: {
+        users: discordMessage.mentions.users.map(user => ({
+          id: user.id,
+          username: user.username
+        })),
+        roles: discordMessage.mentions.roles.map(role => ({
+          id: role.id,
+          name: role.name
+        }))
+      }
+    };
+  }
+}
+### Channel Registry and Management
+
+```typescript
+// Channel registry for managing multiple channels
+class ChannelRegistry {
+  private channels = new Map<string, Channel>();
+  private channelConfigs = new Map<string, ChannelConfig>();
+  
+  async registerChannel(channel: Channel): Promise<void> {
+    // Validate channel configuration
+    await this.validateChannelConfig(channel.config);
+    
+    // Initialize channel
+    await channel.initialize();
+    
+    // Store channel
+    this.channels.set(channel.id, channel);
+    this.channelConfigs.set(channel.id, channel.config);
+    
+    console.log(`Channel ${channel.id} registered successfully`);
+  }
+  
+  async startChannel(channelId: string): Promise<void> {
+    const channel = this.channels.get(channelId);
+    if (!channel) {
+      throw new Error(`Channel ${channelId} not found`);
+    }
+    
+    await channel.start();
+    console.log(`Channel ${channelId} started`);
+  }
+  
+  async stopChannel(channelId: string): Promise<void> {
+    const channel = this.channels.get(channelId);
+    if (!channel) {
+      throw new Error(`Channel ${channelId} not found`);
+    }
+    
+    await channel.stop();
+    console.log(`Channel ${channelId} stopped`);
+  }
+  
+  getChannel(channelId: string): Channel | undefined {
+    return this.channels.get(channelId);
+  }
+  
+  getAllChannels(): Channel[] {
+    return Array.from(this.channels.values());
+  }
+  
+  getHealthyChannels(): Channel[] {
+    return this.getAllChannels().filter(channel => channel.isHealthy());
+  }
+  
+  async validateChannelConfig(config: ChannelConfig): Promise<void> {
+    // Validate required fields
+    if (!config.credentials || Object.keys(config.credentials).length === 0) {
+      throw new Error('Channel credentials are required');
+    }
+    
+    // Validate security settings
+    if (!config.security) {
+      throw new Error('Security configuration is required');
+    }
+    
+    // Channel-specific validation
+    await this.performChannelSpecificValidation(config);
+  }
+}
+```
+
+---
+
+## 🤖 AGENT RUNNER ARCHITECTURE
+
+### Agent Core Components
+
+The Agent Runner is the heart of OpenClaw's AI processing, orchestrating LLM interactions, tool execution, and context management.
+
+```typescript
+// Main agent runner implementation
+class AgentRunner {
+  private llmProvider: LLMProvider;
+  private toolRegistry: ToolRegistry;
+  private sessionManager: SessionManager;
+  private securityManager: SecurityManager;
+  private metricsCollector: MetricsCollector;
+  
+  constructor(dependencies: AgentDependencies) {
+    this.llmProvider = dependencies.llmProvider;
+    this.toolRegistry = dependencies.toolRegistry;
+    this.sessionManager = dependencies.sessionManager;
+    this.securityManager = dependencies.securityManager;
+    this.metricsCollector = dependencies.metricsCollector;
+  }
+  
+  async processMessage(message: IncomingMessage): Promise<AgentResponse> {
+    const startTime = Date.now();
+    const sessionId = this.getOrCreateSessionId(message);
+    
+    try {
+      // Load session context
+      const session = await this.sessionManager.getSession(sessionId);
+      
+      // Security validation
+      await this.securityManager.validateMessage(message, session);
+      
+      // Build conversation context
+      const context = this.buildContext(session, message);
+      
+      // Process with LLM
+      const llmResponse = await this.processWithLLM(context, session.config);
+      
+      // Execute tools if requested
+      const toolResults = await this.executeTools(llmResponse.toolCalls, session);
+      
+      // Update session
+      await this.sessionManager.updateSession(sessionId, {
+        messages: [...session.messages, message, llmResponse],
+        lastActivity: new Date(),
+        toolExecutions: toolResults
+      });
+      
+      // Build response
+      const response = this.buildResponse(llmResponse, toolResults);
+      
+      // Record metrics
+      this.metricsCollector.recordAgentExecution({
+        sessionId,
+        messageCount: session.messages.length,
+        toolCount: toolResults.length,
+        duration: Date.now() - startTime,
+        success: true
+      });
+      
+      return response;
+      
+    } catch (error) {
+      // Handle errors gracefully
+      await this.handleProcessingError(error, sessionId, message);
+      
+      this.metricsCollector.recordAgentExecution({
+        sessionId,
+        duration: Date.now() - startTime,
+        success: false,
+        error: error.message
+      });
+      
+      throw error;
+    }
+  }
+  
+  private async processWithLLM(
+    context: ConversationContext, 
+    config: AgentConfig
+  ): Promise<LLMResponse> {
+    // Build prompt with context
+    const prompt = this.buildPrompt(context, config);
+    
+    // Configure LLM options
+    const options: CompletionOptions = {
+      model: config.model.model,
+      maxTokens: config.memory.contextWindow,
+      temperature: config.model.temperature || 0.7,
+      tools: this.getAvailableTools(config),
+      toolChoice: config.toolChoice || 'auto'
+    };
+    
+    // Call LLM with retry logic
+    return await this.llmProvider.complete(prompt, options);
+  }
+  
+  private async executeTools(
+    toolCalls: ToolCall[], 
+    session: Session
+  ): Promise<ToolExecutionResult[]> {
+    const results: ToolExecutionResult[] = [];
+    
+    for (const toolCall of toolCalls) {
+      try {
+        // Validate tool permissions
+        await this.securityManager.validateToolCall(toolCall, session);
+        
+        // Execute tool in sandbox
+        const result = await this.toolRegistry.execute(toolCall, {
+          sessionId: session.id,
+          userId: session.userId,
+          workspace: session.workspace
+        });
+        
+        results.push({
+          toolCall,
+          result,
+          success: true,
+          executionTime: result.executionTime
+        });
+        
+      } catch (error) {
+        results.push({
+          toolCall,
+          error: error.message,
+          success: false,
+          executionTime: 0
+        });
+      }
+    }
+    
+    return results;
+  }
+}
+```
+
+### Context Management
+
+```typescript
+// Context building and management
+class ContextManager {
+  private maxContextSize: number;
+  private contextCompression: boolean;
+  
+  buildContext(session: Session, currentMessage: IncomingMessage): ConversationContext {
+    const messages = this.selectRelevantMessages(session.messages, currentMessage);
+    const systemPrompt = this.buildSystemPrompt(session.config);
+    const toolContext = this.buildToolContext(session.config);
+    const userContext = this.buildUserContext(session);
+    
+    return {
+      systemPrompt,
+      messages: this.formatMessages(messages),
+      tools: toolContext,
+      user: userContext,
+      metadata: {
+        sessionId: session.id,
+        messageCount: messages.length,
+        contextSize: this.calculateContextSize(messages)
+      }
+    };
+  }
+  
+  private selectRelevantMessages(
+    allMessages: Message[], 
+    currentMessage: IncomingMessage
+  ): Message[] {
+    // Implement context window management
+    if (allMessages.length <= this.maxContextSize) {
+      return allMessages;
+    }
+    
+    // Use context compression if enabled
+    if (this.contextCompression) {
+      return this.compressContext(allMessages, currentMessage);
+    }
+    
+    // Simple truncation (fallback)
+    return allMessages.slice(-this.maxContextSize);
+  }
+  
+  private compressContext(messages: Message[], currentMessage: IncomingMessage): Message[] {
+    // Implement intelligent context compression
+    const compressed: Message[] = [];
+    
+    // Always keep system messages
+    compressed.push(...messages.filter(m => m.role === 'system'));
+    
+    // Keep recent messages
+    const recentMessages = messages.slice(-Math.floor(this.maxContextSize * 0.7));
+    compressed.push(...recentMessages);
+    
+    // Add important historical messages based on relevance scoring
+    const historicalMessages = messages.filter(m => 
+      !compressed.includes(m) && 
+      this.isMessageRelevant(m, currentMessage)
+    );
+    
+    // Fill remaining slots with most relevant historical messages
+    const remainingSlots = this.maxContextSize - compressed.length;
+    compressed.push(...historicalMessages.slice(-remainingSlots));
+    
+    return compressed;
+  }
+  
+  private isMessageRelevant(message: Message, currentMessage: IncomingMessage): boolean {
+    // Implement relevance scoring based on:
+    // - Semantic similarity
+    // - Topic continuity
+    // - User preferences
+    // - Time relevance
+    
+    const messageAge = Date.now() - new Date(message.timestamp).getTime();
+    const maxAge = 24 * 60 * 60 * 1000; // 24 hours
+    
+    if (messageAge > maxAge) {
+      return false;
+    }
+    
+    // Simple keyword matching (can be enhanced with embeddings)
+    const currentKeywords = this.extractKeywords(currentMessage.content);
+    const messageKeywords = this.extractKeywords(message.content);
+    
+    const overlap = currentKeywords.filter(k => messageKeywords.includes(k)).length;
+    const relevance = overlap / Math.max(currentKeywords.length, 1);
+    
+    return relevance > 0.3; // 30% keyword overlap threshold
+  }
+}
+```
+
+---
+
+## 🛠️ TOOL SYSTEM ARCHITECTURE
+
+### Tool Registry and Execution
+
+OpenClaw's tool system provides secure, sandboxed execution of various operations with comprehensive permission management.
+
+```typescript
+// Tool registry implementation
+class ToolRegistry {
+  private tools = new Map<string, Tool>();
+  private permissions = new Map<string, ToolPermissions>();
+  private sandbox: SandboxManager;
+  
+  constructor(sandbox: SandboxManager) {
+    this.sandbox = sandbox;
+  }
+  
+  registerTool(tool: Tool): void {
+    // Validate tool definition
+    this.validateTool(tool);
+    
+    // Register tool
+    this.tools.set(tool.name, tool);
+    
+    // Set default permissions
+    this.permissions.set(tool.name, tool.defaultPermissions || {
+      allowedUsers: [],
+      allowedRoles: [],
+      requiredAuthLevel: 'user',
+      resourceLimits: {
+        maxExecutionTime: 30000, // 30 seconds
+        maxMemoryUsage: 128 * 1024 * 1024, // 128MB
+        maxFileSize: 10 * 1024 * 1024 // 10MB
+      }
+    });
+  }
+  
+  async execute(toolCall: ToolCall, context: ExecutionContext): Promise<ToolResult> {
+    const tool = this.tools.get(toolCall.name);
+    if (!tool) {
+      throw new Error(`Tool ${toolCall.name} not found`);
+    }
+    
+    // Validate permissions
+    await this.validatePermissions(tool, context);
+    
+    // Validate parameters
+    this.validateParameters(tool, toolCall.parameters);
+    
+    // Execute in sandbox
+    return await this.sandbox.execute(tool, toolCall.parameters, context);
+  }
+  
+  private validateTool(tool: Tool): void {
+    if (!tool.name || !tool.description) {
+      throw new Error('Tool must have name and description');
+    }
+    
+    if (!tool.execute || typeof tool.execute !== 'function') {
+      throw new Error('Tool must have an execute function');
+    }
+    
+    // Validate parameter schema
+    if (tool.parameters) {
+      this.validateParameterSchema(tool.parameters);
+    }
+  }
+  
+  private validateParameters(tool: Tool, parameters: any): void {
+    if (!tool.parameters) {
+      return; // No parameters required
+    }
+    
+    // Use JSON schema validation
+    const ajv = new Ajv();
+    const validate = ajv.compile(tool.parameters);
+    
+    if (!validate(parameters)) {
+      throw new Error(`Invalid parameters: ${JSON.stringify(validate.errors)}`);
+    }
+  }
+}
+
+// Built-in file system tool
+class FileSystemTool implements Tool {
+  readonly name = 'file_system';
+  readonly description = 'Read and write files in the workspace';
+  
+  readonly parameters = {
+    type: 'object',
+    properties: {
+      action: {
+        type: 'string',
+        enum: ['read', 'write', 'list', 'delete'],
+        description: 'The action to perform'
+      },
+      path: {
+        type: 'string',
+        description: 'The file path'
+      },
+      content: {
+        type: 'string',
+        description: 'Content to write (for write action)'
+      }
+    },
+    required: ['action', 'path']
+  };
+  
+  readonly defaultPermissions = {
+    allowedUsers: [],
+    allowedRoles: ['admin', 'user'],
+    requiredAuthLevel: 'user',
+    resourceLimits: {
+      maxExecutionTime: 5000,
+      maxMemoryUsage: 64 * 1024 * 1024,
+      maxFileSize: 5 * 1024 * 1024
+    }
+  };
+  
+  async execute(parameters: any, context: ExecutionContext): Promise<ToolResult> {
+    const { action, path, content } = parameters;
+    const workspace = context.workspace;
+    
+    // Validate path is within workspace
+    const resolvedPath = this.resolvePath(path, workspace);
+    if (!this.isPathSafe(resolvedPath, workspace)) {
+      throw new Error('Path access denied - outside workspace');
+    }
+    
+    switch (action) {
+      case 'read':
+        return await this.readFile(resolvedPath);
+      case 'write':
+        return await this.writeFile(resolvedPath, content);
+      case 'list':
+        return await this.listDirectory(resolvedPath);
+      case 'delete':
+        return await this.deleteFile(resolvedPath);
+      default:
+        throw new Error(`Unknown action: ${action}`);
+    }
+  }
+  
+  private async readFile(path: string): Promise<ToolResult> {
+    try {
+      const content = await fs.readFile(path, 'utf-8');
+      return {
+        success: true,
+        data: { content, size: content.length },
+        executionTime: 0
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error.message,
+        executionTime: 0
+      };
+    }
+  }
+  
+  private async writeFile(path: string, content: string): Promise<ToolResult> {
+    try {
+      await fs.writeFile(path, content, 'utf-8');
+      return {
+        success: true,
+        data: { bytesWritten: content.length },
+        executionTime: 0
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error.message,
+        executionTime: 0
+      };
+    }
+  }
+  
+  private isPathSafe(path: string, workspace: string): boolean {
+    const resolved = path.resolve(path);
+    const workspaceResolved = path.resolve(workspace);
+    return resolved.startsWith(workspaceResolved);
+  }
+}
+---
+
+## 🔒 SECURITY ARCHITECTURE
+
+### Zero Trust Security Model
+
+OpenClaw implements a comprehensive zero-trust security model with multiple layers of validation and authorization.
+
+```typescript
+// Security manager implementation
+class SecurityManager {
+  private authManager: AuthManager;
+  private policyEngine: PolicyEngine;
+  private auditLogger: AuditLogger;
+  private inputValidator: InputValidator;
+  
+  async validateMessage(message: IncomingMessage, session: Session): Promise<void> {
+    // Input validation and sanitization
+    await this.inputValidator.validate(message.content);
+    
+    // Rate limiting check
+    await this.checkRateLimits(message.author.id, session.channelId);
+    
+    // Authorization check
+    await this.authManager.authorize(message.author, session);
+    
+    // Content policy check
+    await this.policyEngine.evaluateContent(message.content, session);
+    
+    // Log security event
+    this.auditLogger.log('message_validated', {
+      messageId: message.id,
+      userId: message.author.id,
+      sessionId: session.id,
+      timestamp: new Date()
+    });
+  }
+  
+  async validateToolCall(toolCall: ToolCall, session: Session): Promise<void> {
+    // Tool permission check
+    const hasPermission = await this.policyEngine.checkToolPermission(
+      toolCall.name,
+      session.userId,
+      session.userRoles
+    );
+    
+    if (!hasPermission) {
+      throw new Error(`Access denied for tool: ${toolCall.name}`);
+    }
+    
+    // Parameter security validation
+    await this.validateToolParameters(toolCall);
+    
+    // Resource limit check
+    await this.checkResourceLimits(toolCall, session);
+  }
+  
+  private async validateToolParameters(toolCall: ToolCall): Promise<void> {
+    // Check for dangerous patterns
+    const dangerousPatterns = [
+      /\$\(.*\)/, // Command injection
+      /<script.*>/, // XSS
+      /javascript:/, // JavaScript URLs
+      /data:.*base64/ // Base64 encoded content
+    ];
+    
+    const paramString = JSON.stringify(toolCall.parameters);
+    
+    for (const pattern of dangerousPatterns) {
+      if (pattern.test(paramString)) {
+        throw new Error('Dangerous parameter pattern detected');
+      }
+    }
+  }
+}
+
+// Input validation and sanitization
+class InputValidator {
+  private maxMessageLength = 10000;
+  private allowedMimeTypes = ['text/plain', 'text/markdown'];
+  
+  async validate(content: string): Promise<void> {
+    // Length validation
+    if (content.length > this.maxMessageLength) {
+      throw new Error('Message too long');
+    }
+    
+    // Content sanitization
+    const sanitized = this.sanitizeContent(content);
+    
+    // Malicious content detection
+    await this.detectMaliciousContent(sanitized);
+  }
+  
+  private sanitizeContent(content: string): string {
+    // Remove potentially dangerous HTML
+    const sanitized = content
+      .replace(/<script[^>]*>.*?<\/script>/gi, '')
+      .replace(/<iframe[^>]*>.*?<\/iframe>/gi, '')
+      .replace(/javascript:/gi, '')
+      .replace(/data:/gi, '');
+    
+    return sanitized;
+  }
+  
+  private async detectMaliciousContent(content: string): Promise<void> {
+    // Implement content analysis for malicious patterns
+    const suspiciousPatterns = [
+      /password/i,
+      /token\s*[=:]/,
+      /secret\s*[=:]/,
+      /api[_-]?key/i,
+      /private[_-]?key/i
+    ];
+    
+    for (const pattern of suspiciousPatterns) {
+      if (pattern.test(content)) {
+        this.auditLogger.log('suspicious_content_detected', {
+          pattern: pattern.source,
+          timestamp: new Date()
+        });
+      }
+    }
+  }
+}
+```
+
+### Sandbox Security
+
+```typescript
+// Docker-based sandbox manager
+class DockerSandboxManager implements SandboxManager {
+  private docker: Docker;
+  private activeContainers = new Map<string, Container>();
+  
+  async execute(
+    tool: Tool, 
+    parameters: any, 
+    context: ExecutionContext
+  ): Promise<ToolResult> {
+    const containerId = this.generateContainerId();
+    const startTime = Date.now();
+    
+    try {
+      // Create isolated container
+      const container = await this.createContainer(tool, context);
+      this.activeContainers.set(containerId, container);
+      
+      // Execute tool in container
+      const result = await this.executeInContainer(container, parameters);
+      
+      return {
+        ...result,
+        executionTime: Date.now() - startTime
+      };
+      
+    } finally {
+      // Cleanup container
+      await this.cleanupContainer(containerId);
+    }
+  }
+  
+  private async createContainer(tool: Tool, context: ExecutionContext): Promise<Container> {
+    const workspace = context.workspace;
+    const limits = tool.defaultPermissions?.resourceLimits;
+    
+    const containerConfig = {
+      Image: 'openclaw/tool-sandbox:latest',
+      WorkingDir: '/workspace',
+      HostConfig: {
+        Memory: limits?.maxMemoryUsage || 128 * 1024 * 1024,
+        CpuQuota: 50000, // 50% CPU
+        NetworkMode: 'none', // No network access
+        ReadonlyRootfs: true,
+        Tmpfs: {
+          '/workspace': 'rw,noexec,nosuid,size=100m'
+        },
+        LogConfig: {
+          Type: 'json-file',
+          Config: {
+            'max-size': '10m',
+            'max-file': '3'
+          }
+        }
+      },
+      Env: [
+        `TOOL_NAME=${tool.name}`,
+        `SESSION_ID=${context.sessionId}`,
+        `USER_ID=${context.userId}`
+      ],
+      Labels: {
+        'openclaw.tool': tool.name,
+        'openclaw.session': context.sessionId,
+        'openclaw.user': context.userId
+      }
+    };
+    
+    return await this.docker.createContainer(containerConfig);
+  }
+  
+  private async executeInContainer(
+    container: Container, 
+    parameters: any
+  ): Promise<ToolResult> {
+    // Start container
+    await container.start();
+    
+    // Write parameters to container
+    await container.putArchive(
+      Buffer.from(JSON.stringify(parameters)),
+      { path: '/input.json' }
+    );
+    
+    // Execute tool
+    const exec = await container.exec({
+      Cmd: ['node', '/tool/execute.js', '/input.json'],
+      AttachStdout: true,
+      AttachStderr: true
+    });
+    
+    const stream = await exec.start();
+    const output = await this.streamToString(stream);
+    
+    // Get execution result
+    const result = JSON.parse(output);
+    
+    return result;
+  }
+}
+```
+
+---
+
+## 💾 SESSION MANAGEMENT ARCHITECTURE
+
+### Lane-Based Concurrency
+
+OpenClaw uses a lane-based concurrency pattern to isolate sessions and prevent resource conflicts.
+
+```typescript
+// Session manager with lane isolation
+class SessionManager {
+  private sessions = new Map<string, Session>();
+  private lanes = new Map<string, Lane>();
+  private lanePool: LanePool;
+  
+  async getSession(sessionId: string): Promise<Session> {
+    let session = this.sessions.get(sessionId);
+    
+    if (!session) {
+      // Create new session
+      session = await this.createSession(sessionId);
+      this.sessions.set(sessionId, session);
+    }
+    
+    // Acquire lane for session
+    if (!session.laneId) {
+      const lane = await this.lanePool.acquireLane();
+      session.laneId = lane.id;
+      lane.assignSession(sessionId);
+    }
+    
+    return session;
+  }
+  
+  private async createSession(sessionId: string): Promise<Session> {
+    const workspace = await this.createWorkspace(sessionId);
+    const lane = await this.lanePool.acquireLane();
+    
+    return {
+      id: sessionId,
+      workspace,
+      laneId: lane.id,
+      messages: [],
+      createdAt: new Date(),
+      lastActivity: new Date(),
+      userRoles: ['user'],
+      config: await this.getDefaultConfig()
+    };
+  }
+  
+  async updateSession(sessionId: string, updates: Partial<Session>): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session ${sessionId} not found`);
+    }
+    
+    // Update session
+    Object.assign(session, updates, {
+      lastActivity: new Date()
+    });
+    
+    // Compact context if needed
+    if (session.messages.length > session.config.memory.maxMessages) {
+      session.messages = this.compactMessages(session.messages);
+    }
+    
+    // Persist to Redis
+    await this.persistSession(session);
+  }
+  
+  private compactMessages(messages: Message[]): Message[] {
+    // Implement intelligent message compaction
+    const systemMessages = messages.filter(m => m.role === 'system');
+    const recentMessages = messages.slice(-50);
+    const importantMessages = this.selectImportantMessages(messages);
+    
+    return [...systemMessages, ...importantMessages, ...recentMessages];
+  }
+}
+
+// Lane pool for managing execution lanes
+class LanePool {
+  private lanes: Lane[] = [];
+  private maxLanes = 100;
+  private laneTimeout = 30 * 60 * 1000; // 30 minutes
+  
+  async acquireLane(): Promise<Lane> {
+    // Find available lane
+    let lane = this.lanes.find(l => l.status === 'available');
+    
+    if (!lane) {
+      // Create new lane if under limit
+      if (this.lanes.length < this.maxLanes) {
+        lane = await this.createLane();
+        this.lanes.push(lane);
+      } else {
+        // Wait for lane to become available
+        lane = await this.waitForAvailableLane();
+      }
+    }
+    
+    lane.status = 'in-use';
+    lane.lastUsed = new Date();
+    
+    return lane;
+  }
+  
+  releaseLane(laneId: string): void {
+    const lane = this.lanes.find(l => l.id === laneId);
+    if (lane) {
+      lane.status = 'available';
+      lane.sessionId = undefined;
+      lane.lastUsed = new Date();
+      
+      // Cleanup lane resources
+      this.cleanupLane(lane);
+    }
+  }
+  
+  private async createLane(): Promise<Lane> {
+    const laneId = this.generateLaneId();
+    const workspace = await this.createLaneWorkspace(laneId);
+    
+    return {
+      id: laneId,
+      workspace,
+      status: 'available',
+      createdAt: new Date(),
+      lastUsed: new Date()
+    };
+  }
+  
+  // Periodic cleanup of idle lanes
+  startCleanupTimer(): void {
+    setInterval(() => {
+      this.cleanupIdleLanes();
+    }, 5 * 60 * 1000); // Every 5 minutes
+  }
+  
+  private cleanupIdleLanes(): void {
+    const now = Date.now();
+    
+    for (const lane of this.lanes) {
+      if (lane.status === 'available' && 
+          now - lane.lastUsed.getTime() > this.laneTimeout) {
+        this.destroyLane(lane);
+      }
+    }
+  }
+}
+```
+
+---
+
+## 🚀 DEPLOYMENT ARCHITECTURE
+
+### Production Deployment Pattern
+
+OpenClaw's deployment architecture is designed for high availability, scalability, and security.
+
+```yaml
+# docker-compose.prod.yml
+version: '3.8'
+
+services:
+  gateway:
+    image: openclaw/gateway:latest
+    replicas: 3
+    environment:
+      - NODE_ENV=production
+      - REDIS_URL=redis://redis-cluster:6379
+      - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/openclaw
+      - JWT_SECRET=${JWT_SECRET}
+    volumes:
+      - ./config:/app/config:ro
+      - ./logs:/app/logs
+    networks:
+      - openclaw-network
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      update_config:
+        parallelism: 1
+        delay: 10s
+        failure_action: rollback
+
+  agent-runner:
+    image: openclaw/agent-runner:latest
+    replicas: 5
+    environment:
+      - NODE_ENV=production
+      - LLM_PROVIDER=${LLM_PROVIDER}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - REDIS_URL=redis://redis-cluster:6379
+    volumes:
+      - ./workspaces:/app/workspaces
+      - ./tools:/app/tools:ro
+    networks:
+      - openclaw-network
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  redis-cluster:
+    image: redis:7-alpine
+    command: redis-server --cluster-enabled yes --cluster-config-file nodes.conf
+    volumes:
+      - redis-data:/data
+    networks:
+      - openclaw-network
+    deploy:
+      replicas: 6
+      placement:
+        max_replicas_per_node: 1
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=openclaw
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    networks:
+      - openclaw-network
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 1G
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - openclaw-network
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+    networks:
+      - openclaw-network
+
+networks:
+  openclaw-network:
+    driver: overlay
+    attachable: true
+
+volumes:
+  redis-data:
+  postgres-data:
+  prometheus-data:
+  grafana-data:
+```
+
+### Kubernetes Deployment
+
+```yaml
+# k8s/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openclaw-gateway
+  labels:
+    app: openclaw-gateway
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: openclaw-gateway
+  template:
+    metadata:
+      labels:
+        app: openclaw-gateway
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: gateway
+        image: openclaw/gateway:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+        - containerPort: 9090
+          name: metrics
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: openclaw-secrets
+              key: redis-url
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: openclaw-secrets
+              key: database-url
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: openclaw-secrets
+              key: jwt-secret
+        resources:
+          requests:
+            cpu: 250m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+          readOnly: true
+        - name: logs
+          mountPath: /app/logs
+      volumes:
+      - name: config
+        configMap:
+          name: openclaw-config
+      - name: logs
+        emptyDir: {}
+      imagePullSecrets:
+      - name: registry-secret
+```
+
+---
+
+## 📊 MONITORING & OBSERVABILITY
+
+### Metrics Collection
+
+OpenClaw implements comprehensive monitoring with Prometheus metrics and distributed tracing.
+
+```typescript
+// Metrics collector implementation
+class MetricsCollector {
+  private registry = new Registry();
+  private metrics: Map<string, any> = new Map();
+  
+  constructor() {
+    this.initializeMetrics();
+  }
+  
+  private initializeMetrics(): void {
+    // Request metrics
+    this.metrics.set('httpRequestsTotal', new Counter({
+      name: 'openclaw_http_requests_total',
+      help: 'Total number of HTTP requests',
+      labelNames: ['method', 'route', 'status_code']
+    }));
+    
+    // Duration metrics
+    this.metrics.set('httpRequestDuration', new Histogram({
+      name: 'openclaw_http_request_duration_seconds',
+      help: 'HTTP request duration in seconds',
+      labelNames: ['method', 'route'],
+      buckets: [0.1, 0.5, 1, 2, 5, 10]
+    }));
+    
+    // Agent execution metrics
+    this.metrics.set('agentExecutionsTotal', new Counter({
+      name: 'openclaw_agent_executions_total',
+      help: 'Total number of agent executions',
+      labelNames: ['session_type', 'success']
+    }));
+    
+    // Tool execution metrics
+    this.metrics.set('toolExecutionsTotal', new Counter({
+      name: 'openclaw_tool_executions_total',
+      help: 'Total number of tool executions',
+      labelNames: ['tool_name', 'success']
+    }));
+    
+    // LLM metrics
+    this.metrics.set('llmRequestsTotal', new Counter({
+      name: 'openclaw_llm_requests_total',
+      help: 'Total number of LLM requests',
+      labelNames: ['provider', 'model', 'status']
+    }));
+    
+    this.metrics.set('llmTokensTotal', new Counter({
+      name: 'openclaw_llm_tokens_total',
+      help: 'Total number of LLM tokens',
+      labelNames: ['provider', 'model', 'type']
+    }));
+    
+    // System metrics
+    this.metrics.set('activeSessions', new Gauge({
+      name: 'openclaw_active_sessions',
+      help: 'Number of active sessions'
+    }));
+    
+    this.metrics.set('activeLanes', new Gauge({
+      name: 'openclaw_active_lanes',
+      help: 'Number of active execution lanes'
+    }));
+    
+    // Register all metrics
+    for (const metric of this.metrics.values()) {
+      this.registry.registerMetric(metric);
+    }
+  }
+  
+  recordHttpRequest(method: string, route: string, statusCode: number, duration: number): void {
+    this.metrics.get('httpRequestsTotal')?.inc({
+      method,
+      route,
+      status_code: statusCode.toString()
+    });
+    
+    this.metrics.get('httpRequestDuration')?.observe({
+      method,
+      route
+    }, duration / 1000);
+  }
+  
+  recordAgentExecution(execution: AgentExecution): void {
+    this.metrics.get('agentExecutionsTotal')?.inc({
+      session_type: execution.sessionType || 'standard',
+      success: execution.success.toString()
+    });
+  }
+  
+  recordToolExecution(toolName: string, success: boolean, duration: number): void {
+    this.metrics.get('toolExecutionsTotal')?.inc({
+      tool_name: toolName,
+      success: success.toString()
+    });
+  }
+  
+  recordLLMRequest(request: LLMRequest): void {
+    this.metrics.get('llmRequestsTotal')?.inc({
+      provider: request.provider,
+      model: request.model,
+      status: request.success ? 'success' : 'error'
+    });
+    
+    if (request.tokens) {
+      this.metrics.get('llmTokensTotal')?.inc({
+        provider: request.provider,
+        model: request.model,
+        type: 'input'
+      }, request.tokens.input);
+      
+      this.metrics.get('llmTokensTotal')?.inc({
+        provider: request.provider,
+        model: request.model,
+        type: 'output'
+      }, request.tokens.output);
+    }
+  }
+  
+  updateActiveSessions(count: number): void {
+    this.metrics.get('activeSessions')?.set(count);
+  }
+  
+  updateActiveLanes(count: number): void {
+    this.metrics.get('activeLanes')?.set(count);
+  }
+  
+  getMetrics(): string {
+    return this.registry.metrics();
+  }
+}
+```
+
+---
+
+## 📋 REFERENCE ARCHITECTURE OVERVIEW
         Mobile[Mobile App]
         API[REST/GraphQL API]
     end
